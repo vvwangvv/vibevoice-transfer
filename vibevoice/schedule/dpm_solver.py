@@ -19,11 +19,15 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-
 from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.schedulers.scheduling_utils import (
+    KarrasDiffusionSchedulers,
+    SchedulerMixin,
+    SchedulerOutput,
+)
 from diffusers.utils import deprecate
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
+
 
 def betas_for_alpha_bar(
     num_diffusion_timesteps,
@@ -118,6 +122,7 @@ def rescale_zero_terminal_snr(betas):
     betas = 1 - alphas
 
     return betas
+
 
 class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
     """
@@ -1042,8 +1047,10 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             sigma_t = sigma_t.unsqueeze(-1)
         noisy_samples = alpha_t * original_samples + sigma_t * noise
         return noisy_samples
-    
-    def get_velocity(self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor) -> torch.Tensor:
+
+    def get_velocity(
+        self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor
+    ) -> torch.Tensor:
         # alpha_t = self.alpha_t.to(device=original_samples.device, dtype=original_samples.dtype)
         # sigma_t = self.sigma_t.to(device=original_samples.device, dtype=original_samples.dtype)
         alpha_t = self.alpha_t.to(original_samples.device).to(original_samples.dtype)

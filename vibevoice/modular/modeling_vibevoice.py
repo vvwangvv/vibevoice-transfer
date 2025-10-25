@@ -1,39 +1,46 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union, Callable
-from tqdm import tqdm
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-
-from transformers.models.auto import AutoModel, AutoModelForCausalLM
-
-from transformers.activations import ACT2FN
-from transformers.modeling_outputs import CausalLMOutput, BaseModelOutputWithPast, ModelOutput
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from tqdm import tqdm
 from transformers import modeling_utils
-from transformers.modeling_utils import PreTrainedModel
+from transformers.activations import ACT2FN
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutput,
+    ModelOutput,
+)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.auto import AutoModel, AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.utils import logging
 
-
-from .modular_vibevoice_tokenizer import VibeVoiceTokenizerStreamingCache, VibeVoiceAcousticTokenizerModel, VibeVoiceSemanticTokenizerModel
-from .modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
 from vibevoice.schedule.dpm_solver import DPMSolverMultistepScheduler
 
 from .configuration_vibevoice import VibeVoiceConfig
+from .modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
 
+# these are necessary for AutoModel registration
+from .modular_vibevoice_tokenizer import (
+    VibeVoiceAcousticTokenizerModel,
+    VibeVoiceSemanticTokenizerModel,
+    VibeVoiceTokenizerStreamingCache,
+)
 
 logger = logging.get_logger(__name__)
 
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
 
+
 @dataclass
 class VibeVoiceCausalLMOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     diffusion_loss: Optional[torch.FloatTensor] = None
-    speech_token_num: Optional[int] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -44,13 +51,14 @@ class VibeVoiceCausalLMOutputWithPast(ModelOutput):
 class VibeVoiceGenerationOutput(ModelOutput):
     """
     Output type for VibeVoice generation.
-    
+
     Args:
         sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            The generated sequences. 
+            The generated sequences.
         speech_outputs (`List[torch.FloatTensor]`, *optional*):
             List of generated speech waveforms or latents for each speech segment.
     """
+
     sequences: torch.LongTensor = None
     speech_outputs: Optional[List[torch.FloatTensor]] = None
 
@@ -62,7 +70,7 @@ class SpeechConnector(nn.Module):
         self.norm = LlamaRMSNorm(output_dim, eps=1e-6)
         self.fc2 = nn.Linear(output_dim, output_dim)
 
-    def forward(self, features, **kwargs):    
+    def forward(self, features, **kwargs):
         x = self.fc1(features)
         x = self.norm(x)
         x = self.fc2(x)
@@ -88,13 +96,15 @@ class VibeVoicePreTrainedModel(PreTrainedModel):
             return
 
         # Use the language model's initializer_range if available
-        if hasattr(self.config, 'language_model_config') and hasattr(self.config.language_model_config, 'initializer_range'):
+        if hasattr(self.config, "language_model_config") and hasattr(
+            self.config.language_model_config, "initializer_range"
+        ):
             std = self.config.language_model_config.initializer_range
-        elif hasattr(self.config, 'decoder_config') and hasattr(self.config.decoder_config, 'initializer_range'):
+        elif hasattr(self.config, "decoder_config") and hasattr(self.config.decoder_config, "initializer_range"):
             std = self.config.decoder_config.initializer_range
         else:
             std = 0.02  # Default value
-            
+
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
@@ -103,33 +113,34 @@ class VibeVoicePreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
             module.bias.data.zero_()
 
+
 # @auto_docstring
 class VibeVoiceModel(VibeVoicePreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+
+        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
             if isinstance(config.torch_dtype, str):
                 dtype = getattr(torch, config.torch_dtype)
             else:
                 dtype = config.torch_dtype
         else:
             dtype = torch.float32
-        
+
         # Initialize Qwen2 model for language modeling
-        lm_config = config.decoder_config 
+        lm_config = config.decoder_config
         self.language_model = AutoModel.from_config(lm_config)
-        
+
         # Initialize speech components if needed
         self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(dtype)
         self.semantic_tokenizer = AutoModel.from_config(config.semantic_tokenizer_config).to(dtype)
 
         self.acoustic_connector = SpeechConnector(config.acoustic_vae_dim, lm_config.hidden_size).to(dtype)
         self.semantic_connector = SpeechConnector(config.semantic_vae_dim, lm_config.hidden_size).to(dtype)
-        
+
         # Register scaling factors as buffers - use 1D tensors for FSDP compatibility
-        self.register_buffer('speech_scaling_factor', torch.tensor(float('nan')))  
-        self.register_buffer('speech_bias_factor', torch.tensor(float('nan')))
+        self.register_buffer("speech_scaling_factor", torch.tensor(float("nan")))
+        self.register_buffer("speech_bias_factor", torch.tensor(float("nan")))
 
         # Initialize prediction head for speech generation
         self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(dtype)
@@ -138,34 +149,34 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
         self.noise_scheduler = DPMSolverMultistepScheduler(
             num_train_timesteps=config.diffusion_head_config.ddpm_num_steps,
             beta_schedule=config.diffusion_head_config.ddpm_beta_schedule,
-            prediction_type=config.diffusion_head_config.prediction_type
+            prediction_type=config.diffusion_head_config.prediction_type,
         )
-    
+
     def get_input_embeddings(self):
-        if hasattr(self.language_model, 'embed_tokens'):
+        if hasattr(self.language_model, "embed_tokens"):
             # If the language model has an embed_tokens attribute, return it
             return self.language_model.embed_tokens
-        
-        for name, attr in self.language_model.fullmap.items(): # parallel by nnscaler, the name is changed
-            if attr.orig_name == 'embed_tokens.weight':
+
+        for name, attr in self.language_model.fullmap.items():  # parallel by nnscaler, the name is changed
+            if attr.orig_name == "embed_tokens.weight":
                 return getattr(self.language_model, name)
-        assert False, 'should not arrive here'
+        assert False, "should not arrive here"
 
     def set_input_embeddings(self, value):
         self.language_model.embed_tokens = value
-    
+
     def set_speech_tokenizers(self, acoustic_tokenizer=None, semantic_tokenizer=None):
         """Set the speech tokenizers used for encoding and decoding speech."""
         self.acoustic_tokenizer = acoustic_tokenizer
         self.semantic_tokenizer = semantic_tokenizer
-        
+
         # Reset the encoder to evaluation mode
         if self.acoustic_tokenizer is not None:
             self.acoustic_tokenizer.eval()
-            
+
         if self.semantic_tokenizer is not None:
             self.semantic_tokenizer.eval()
-    
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -180,9 +191,9 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
         # Forward through language model
         outputs = self.language_model(
             input_ids=input_ids,
@@ -197,10 +208,10 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
             cache_position=cache_position,
             **kwargs,
         )
-        
+
         if not return_dict:
             return outputs
-            
+
         return BaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
@@ -220,7 +231,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         self.lm_head = nn.Linear(config.decoder_config.hidden_size, self.vocab_size, bias=False)
 
         self.post_init()
-        
+
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
@@ -240,13 +251,13 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         """
         Tie the weights between the input embeddings and the output embeddings.
         """
-        if getattr(self.config.decoder_config, 'tie_word_embeddings', False):
+        if getattr(self.config.decoder_config, "tie_word_embeddings", False):
             # The standard PreTrainedModel method will handle the tying.
             # It typically does a simple parameter object assignment, which is
             # CORRECT to do BEFORE FSDP wraps the model.
             output_embeddings = self.get_output_embeddings()
             input_embeddings = self.get_input_embeddings()
-            if hasattr(input_embeddings, 'weight'):
+            if hasattr(input_embeddings, "weight"):
                 output_embeddings.weight = input_embeddings.weight
             else:
                 # maybe returned input_embeddings a tensor directly
@@ -270,65 +281,56 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         # but the best way is to not call this after prepare().
         self.lm_head = new_embeddings
 
-    def forward_speech_features(
-            self, 
-            speech_tensors=None, 
-            speech_masks=None, 
-            speech_type="audio", 
-            return_unmask=False
-        ):
-        if speech_tensors is None:
+    @torch.no_grad()
+    def compute_acoustic_tokens(self, speech_tensors=None, speech_type="audio"):
+        if speech_type == "audio":
+            frames = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))[0][0]
+            acoustic_tokens = frames.sample(self.model.acoustic_tokenizer.std_dist_type)[0]
+
+        elif speech_type == "vae":
             # Use config to get vae_dim instead of non-existent self.args
             vae_dim = self.config.acoustic_tokenizer_config.vae_dim
-            audio_features = torch.zeros(1, 1, vae_dim).to(self.get_input_embeddings().weight)
-            connect_features = self.model.acoustic_connector(audio_features)
-            return audio_features, connect_features
+            speech_mode = speech_tensors.reshape(speech_tensors.size(0), -1, vae_dim)
+
+            # gaussian sample from the speech_mode
+            batch_size = speech_mode.size(0)
+            value = self.model.acoustic_tokenizer.fix_std / 0.8
+            std = torch.randn(batch_size, dtype=speech_mode.dtype, device=speech_mode.device) * value
+            std = std.view(-1, *[1] * (speech_mode.dim() - 1))
+            acoustic_tokens = speech_mode + std * torch.randn(speech_mode.shape).to(speech_mode)
         else:
-            with torch.no_grad():
-                if speech_type == "audio":
-                    with torch.no_grad():
-                        frames = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))[0][0]
-                    audio_tokens = frames.sample(self.model.acoustic_tokenizer.std_dist_type)[0]
+            raise NotImplementedError(f"Speech type {speech_type} not implemented")
 
-                elif speech_type == "vae":
-                    # Use config to get vae_dim instead of non-existent self.args
-                    vae_dim = self.config.acoustic_tokenizer_config.vae_dim
-                    speech_mode = speech_tensors.reshape(speech_tensors.size(0), -1, vae_dim)
+        return acoustic_tokens
 
-                    # gaussian sample from the speech_mode
-                    batch_size = speech_mode.size(0)
-                    value = self.model.acoustic_tokenizer.fix_std / 0.8
-                    std = torch.randn(batch_size, dtype=speech_mode.dtype, device=speech_mode.device) * value
-                    std = std.view(-1, *[1] * (speech_mode.dim() - 1))
-                    audio_tokens = speech_mode + std * torch.randn(speech_mode.shape).to(speech_mode)
-                else:
-                    raise NotImplementedError(f"Speech type {speech_type} not implemented")
-                
-                if torch.isnan(self.model.speech_scaling_factor) or torch.isnan(self.model.speech_bias_factor):
-                    scaling_factor = 1. / audio_tokens[speech_masks].flatten().std()
-                    bias_factor = -audio_tokens[speech_masks].flatten().mean()
-                    
-                    # Only use distributed operations if the process group is initialized
-                    if dist.is_available() and dist.is_initialized():
-                        dist.all_reduce(scaling_factor, op=dist.ReduceOp.SUM)
-                        dist.all_reduce(bias_factor, op=dist.ReduceOp.SUM)
-                        world_size = dist.get_world_size()
-                        self.model.speech_scaling_factor.copy_(scaling_factor / world_size)  
-                        self.model.speech_bias_factor.copy_(bias_factor / world_size)
-                        print(f"Speech scaling factor (distributed): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}", flush=True)
-                    else:
-                        # Single process case
-                        self.model.speech_scaling_factor.copy_(scaling_factor)  
-                        self.model.speech_bias_factor.copy_(bias_factor)
-                        print(f"Speech scaling factor (single process): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}", flush=True)
-                    
-                audio_features = (audio_tokens + self.model.speech_bias_factor) * self.model.speech_scaling_factor
-            
-            connect_features = self.model.acoustic_connector(audio_features)
-            if return_unmask:
-                return audio_features, connect_features
-            return audio_features[speech_masks], connect_features[speech_masks]
-        
+    @torch.no_grad()
+    def compute_semantic_tokens(self, speech_tensors):
+        semantic_tokens = self.model.semantic_tokenizer.encode(speech_tensors.unsqueeze(1)).mean
+        return semantic_tokens
+
+    def update_speech_scaling_factors(self, audio_tokens, speech_masks):
+        scaling_factor = 1.0 / audio_tokens[speech_masks].flatten().std()
+        bias_factor = -audio_tokens[speech_masks].flatten().mean()
+        # Only use distributed operations if the process group is initialized
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(scaling_factor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(bias_factor, op=dist.ReduceOp.SUM)
+            world_size = dist.get_world_size()
+            self.model.speech_scaling_factor.copy_(scaling_factor / world_size)
+            self.model.speech_bias_factor.copy_(bias_factor / world_size)
+            print(
+                f"Speech scaling factor (distributed): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}",
+                flush=True,
+            )
+        else:
+            # Single process case
+            self.model.speech_scaling_factor.copy_(scaling_factor)
+            self.model.speech_bias_factor.copy_(bias_factor)
+            print(
+                f"Speech scaling factor (single process): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}",
+                flush=True,
+            )
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -343,51 +345,42 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         # New arguments for speech processing and loss calculation
-        speech_tensors: Optional[torch.FloatTensor] = None,
-        speech_masks: Optional[torch.BoolTensor] = None,
-        speeches_loss_input: Optional[torch.FloatTensor] = None,
-        speech_semantic_tensors: Optional[torch.FloatTensor] = None, 
+        acoustic_speech: Optional[torch.FloatTensor] = None,
+        semantic_speech: Optional[torch.FloatTensor] = None,
+        acoustic_speech_mask: Optional[torch.BoolTensor] = None,
+        semantic_speech_mask: Optional[torch.BoolTensor] = None,
+        acoustic_speech_loss_mask: Optional[torch.FloatTensor] = None,
         acoustic_input_mask: Optional[torch.BoolTensor] = None,
-        acoustic_loss_mask: Optional[torch.BoolTensor] = None,
+        semantic_input_mask: Optional[torch.BoolTensor] = None,
+        diffusion_loss_mask: Optional[torch.BoolTensor] = None,
         ddpm_batch_mul: int = 1,
         **kwargs: Optional[Dict[str, Union[torch.Tensor, str]]],
-        ) -> Union[Tuple, VibeVoiceCausalLMOutputWithPast]:
-        
+    ) -> Union[Tuple, VibeVoiceCausalLMOutputWithPast]:
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
         x = self.get_input_embeddings()(input_ids)
 
-        semantic_speech_all_connect_features = self.model.semantic_connector(speech_semantic_tensors)
-        if speeches_loss_input is not None:
-            # only part audio need diffuse
-            speech_all_features, speech_all_connect_features = self.forward_speech_features(
-                    speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
-                    speech_masks=speech_masks,
-                    speech_type=kwargs.get("speech_type", "audio"),
-                    return_unmask=True
-                )
-            if speech_tensors is not None:
-                if semantic_speech_all_connect_features is not None:
-                    x[acoustic_input_mask] = (
-                        speech_all_connect_features[speech_masks]
-                        + semantic_speech_all_connect_features[speech_masks]
-                    )
-                else:
-                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
+        diffusion_speech_target = None
+        x[semantic_input_mask | acoustic_input_mask] = 0
+        if acoustic_speech is not None:
+            acoustic_tokens = self.compute_acoustic_tokens(
+                speech_tensors=acoustic_speech,
+                speech_type=kwargs.get("speech_type", "audio"),
+            )
 
-                # Select only the target segments' latents for diffusion loss.
-                # Both masks are [num_segments, max_latent_len]; using 2D mask on [B,T,D] selects [N_true, D].
-                target_latent_mask = speeches_loss_input & speech_masks
-                speech_features = speech_all_features[target_latent_mask]
-                speech_connect_features = speech_all_connect_features[target_latent_mask]
-        else:
-            speech_features, speech_connect_features = self.forward_speech_features(
-                    speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
-                    speech_masks=speech_masks,
-                    speech_type=kwargs.get("speech_type", "audio"),
-                )
-            if speech_tensors is not None:
-                x[acoustic_input_mask] = speech_connect_features
+            if torch.isnan(self.model.speech_scaling_factor) or torch.isnan(self.model.speech_bias_factor):
+                self.update_speech_scaling_factors(acoustic_tokens, acoustic_speech_mask)
+            acoustic_tokens = (acoustic_tokens + self.model.speech_bias_factor) * self.model.speech_scaling_factor
+            acoustic_connect_features = self.model.acoustic_connector(acoustic_tokens)
+
+            x[acoustic_input_mask] += acoustic_connect_features[acoustic_speech_mask]
+            diffusion_speech_target = acoustic_tokens[acoustic_speech_loss_mask]
+
+        if semantic_speech is not None:
+            semantic_tokens = self.compute_semantic_tokens(speech_tensors=semantic_speech)
+            semantic_connect_features = self.model.semantic_connector(semantic_tokens)
+            x[semantic_input_mask] += semantic_connect_features[semantic_speech_mask]
 
         outputs = self.model(
             input_ids=None,
@@ -404,84 +397,78 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        # logits = logits.float()
 
         loss = None
         if labels is not None:
-            # The custom CE loss with masking is calculated in the training script.
-            # We leave the standard loss calculation here as None.
             pass
 
         # --- Diffusion Loss Calculation ---
         diffusion_loss = None
         # This block is executed only if we are in a context that involves speech.
-        if speech_tensors is not None and acoustic_loss_mask.sum().item() > 0:
-            condition_features = hidden_states[acoustic_loss_mask]
-            
-            speech_len, latent_size = speech_features.shape
-            
-            noise = torch.randn(
-                (speech_len * ddpm_batch_mul, latent_size),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype
+        if diffusion_loss_mask.sum() > 0:
+            diffusion_loss = self.compute_diffusion_loss(
+                hidden_states,
+                diffusion_speech_target,
+                diffusion_loss_mask,
+                ddpm_batch_mul,
             )
-            
-            timesteps = torch.multinomial(
-                torch.ones(self.config.diffusion_head_config.ddpm_num_steps),
-                speech_len * ddpm_batch_mul,
-                replacement=True,
-            ).to(hidden_states.device)
-
-            speech_features_repeated = speech_features.repeat_interleave(ddpm_batch_mul, dim=0)
-            condition_features_repeated = condition_features.repeat_interleave(ddpm_batch_mul, dim=0)
-
-            noisy_speech_features = self.model.noise_scheduler.add_noise(
-                speech_features_repeated, noise, timesteps
-            )
-            
-            model_output = self.model.prediction_head(
-                noisy_speech_features, 
-                timesteps.type_as(x), 
-                condition_features_repeated
-            )
-
-            prediction_type = self.config.diffusion_head_config.prediction_type
-            if prediction_type == "epsilon":
-                target_for_loss = noise
-            elif prediction_type == "v_prediction":
-                target_for_loss = self.model.noise_scheduler.get_velocity(
-                    speech_features_repeated, noise, timesteps
-                )
-            else:
-                raise NotImplementedError(f"Prediction type {prediction_type} not implemented")
-
-            diffusion_loss = F.mse_loss(model_output.float(), target_for_loss.float(), reduction='sum')
-            if latent_size > 0 and ddpm_batch_mul > 0:
-                diffusion_loss = diffusion_loss / latent_size / ddpm_batch_mul
-            else:
-                diffusion_loss = torch.tensor(0.0, device=diffusion_loss.device)
-        
-        else:
-            # Dummy loss for DDP to work when there are no speech samples in a batch,
-            # but we are in a speech context.
-            diffusion_loss = sum(p.sum() for p in self.model.prediction_head.parameters()) * 0.0
-            diffusion_loss += sum(p.sum() for p in self.model.acoustic_connector.parameters()) * 0.0
-            diffusion_loss += sum(p.sum() for p in self.model.semantic_connector.parameters()) * 0.0
         # --- End Diffusion Loss Calculation ---
 
         if not return_dict:
-            output = (logits, speech_len) + outputs.to_tuple()[1:]
+            output = (logits,) + outputs.to_tuple()[1:]
             return (loss, diffusion_loss) + output
 
         return VibeVoiceCausalLMOutputWithPast(
             loss=loss,
             diffusion_loss=diffusion_loss,
-            speech_token_num=speech_len if speech_tensors is not None else 0,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def compute_diffusion_loss(self, hidden_states, speech_features, diffusion_loss_mask, ddpm_batch_mul):
+        # condition_features = hidden_states[speech_diffusion_loss_mask]
+        cond_mask = torch.zeros_like(diffusion_loss_mask, dtype=torch.bool)
+        cond_mask[:, :-1] = diffusion_loss_mask[:, 1:]
+        cond_mask[:, 0] = False
+        condition_features = hidden_states[cond_mask]
+
+        speech_len, latent_size = speech_features.shape
+        noise = torch.randn(
+            (speech_len * ddpm_batch_mul, latent_size), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+
+        timesteps = torch.multinomial(
+            torch.ones(self.config.diffusion_head_config.ddpm_num_steps),
+            speech_len * ddpm_batch_mul,
+            replacement=True,
+        ).to(hidden_states.device)
+
+        speech_features_repeated = speech_features.repeat_interleave(ddpm_batch_mul, dim=0)
+        condition_features_repeated = condition_features.repeat_interleave(ddpm_batch_mul, dim=0)
+
+        noisy_speech_features = self.model.noise_scheduler.add_noise(speech_features_repeated, noise, timesteps)
+
+        model_output = self.model.prediction_head(
+            noisy_speech_features, timesteps.type_as(noisy_speech_features), condition_features_repeated
+        )
+
+        prediction_type = self.config.diffusion_head_config.prediction_type
+        if prediction_type == "epsilon":
+            target_for_loss = noise
+        elif prediction_type == "v_prediction":
+            target_for_loss = self.model.noise_scheduler.get_velocity(speech_features_repeated, noise, timesteps)
+        else:
+            raise NotImplementedError(f"Prediction type {prediction_type} not implemented")
+
+        diffusion_loss = F.mse_loss(model_output.float(), target_for_loss.float(), reduction="sum")
+        if latent_size > 0 and ddpm_batch_mul > 0:
+            diffusion_loss = diffusion_loss / latent_size / ddpm_batch_mul / max(speech_len, 1)
+        else:
+            diffusion_loss = torch.tensor(0.0, device=diffusion_loss.device)
+        return diffusion_loss
+
 
 AutoModel.register(VibeVoiceConfig, VibeVoiceModel)
 AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGeneration)
