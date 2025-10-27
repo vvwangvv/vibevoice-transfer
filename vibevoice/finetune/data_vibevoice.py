@@ -85,7 +85,6 @@ class VibeVoiceDataset:
             except Exception as e:
                 warnings.warn(f"Could not create voice prompt for item {idx}: {e}")
                 data["voice_prompts"] = None
-        data["task"] = item.get("task", "generation")
         data["generation_task_prob"] = item.get("generation_task_prob", 1.0)
         return data
 
@@ -204,7 +203,6 @@ class VibeVoiceCollator:
 
     text_field: str = "text"
     audio_field: str = "audio"
-    task_field: str = "task"  # "generation" or "understanding"
     voice_prompts_field: str = "voice_prompts"
     voice_prompt_drop_rate: float = 0.0
 
@@ -223,7 +221,8 @@ class VibeVoiceCollator:
             text: str = ex.get(self.text_field, "")
             voice_prompts: Optional[List[Union[str, np.ndarray, torch.Tensor]]] = ex.get(self.voice_prompts_field)
             audio: Union[str, np.ndarray, torch.Tensor, Dict[str, Any]] = ex.get(self.audio_field)
-            task: str = ex[self.task_field]
+            generation_task_prob: float = ex.get("generation_task_prob", 1.0)
+            task = "generation" if random.random() < generation_task_prob else "understanding"
 
             proc = self.processor(
                 text=[text],

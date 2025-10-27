@@ -284,7 +284,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
     @torch.no_grad()
     def compute_acoustic_tokens(self, speech_tensors=None, speech_type="audio"):
         if speech_type == "audio":
-            frames = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))[0][0]
+            frames = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))
             acoustic_tokens = frames.sample(self.model.acoustic_tokenizer.std_dist_type)[0]
 
         elif speech_type == "vae":

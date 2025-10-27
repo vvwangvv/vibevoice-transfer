@@ -153,164 +153,6 @@ class CustomTrainingArguments(HfTrainingArguments):
 
 
 class VibeVoiceTrainer(Trainer):
-    def training_forward(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any]):
-        """Custom forward pass for training with new diffusion loss calculation."""
-        # Extract inputs
-        input_ids = inputs.get("input_ids")
-        attention_mask = inputs.get("attention_mask")
-        position_ids = inputs.get("position_ids")
-        past_key_values = inputs.get("past_key_values")
-        inputs_embeds = inputs.get("inputs_embeds")
-        use_cache = inputs.get("use_cache", False)
-        output_attentions = inputs.get("output_attentions")
-        output_hidden_states = inputs.get("output_hidden_states")
-        return_dict = inputs.get("return_dict", True)
-        cache_position = inputs.get("cache_position")
-
-        # Speech-related inputs
-        speech_tensors = inputs.get("speech_tensors")
-        speech_masks = inputs.get("speech_masks")
-        speeches_loss_input = inputs.get("speeches_loss_input")
-        speech_semantic_tensors = inputs.get("speech_semantic_tensors")
-        acoustic_input_mask = inputs.get("acoustic_input_mask")
-        acoustic_loss_mask = inputs.get("acoustic_loss_mask")
-        ddmp_batch_mul = training_args.ddpm_batch_mul
-        kwargs = {}
-
-        # --- START: Copy of model forward logic with new diffusion loss ---
-        x = model.get_input_embeddings()(input_ids)
-
-        x[semantic_input_mask | acoustic_input_mask].fill_(0.0)
-        if semantic_input_mask.sum() > 0:
-            semantic_speech_all_connect_features = model.model.semantic_connector(speech_semantic_tensors)
-            x[semantic_input_mask] += semantic_speech_all_connect_features[semantic_input_mask]
-
-        if speeches_loss_input is not None and speeches_loss_input.sum() > 0:
-            # only part audio need diffuse
-            speech_all_features, speech_all_connect_features = model.forward_speech_features(
-                speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
-                speech_masks=speech_masks,
-                speech_type=kwargs.get("speech_type", "audio"),
-                return_unmask=True,
-            )
-            if speech_tensors is not None:
-                if semantic_speech_all_connect_features is not None:
-                    x[acoustic_input_mask] = (
-                        speech_all_connect_features[speech_masks] + semantic_speech_all_connect_features[speech_masks]
-                    )
-                else:
-                    x[acoustic_input_mask] = speech_all_connect_features[speech_masks]
-                speech_features = speech_all_features[
-                    speeches_loss_input & speech_masks
-                ]  # only part audio need diffuse
-                speech_connect_features = speech_all_connect_features[speeches_loss_input & speech_masks]
-                # Forward-time consistency check: selected latent count should match number of acoustic placeholders
-                try:
-                    if acoustic_input_mask is not None:
-                        assert speech_connect_features.shape[0] == int(
-                            acoustic_input_mask.sum().item()
-                        ), f"Mismatch between selected speech connectors ({speech_connect_features.shape[0]}) and acoustic_input_mask sum ({int(acoustic_input_mask.sum().item())})"
-                except Exception:
-                    pass
-        else:
-            speech_features, speech_connect_features = model.forward_speech_features(
-                speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
-                speech_masks=speech_masks,
-                speech_type=kwargs.get("speech_type", "audio"),
-            )
-            if speech_tensors is not None:
-                x[acoustic_input_mask] = speech_connect_features
-
-        outputs = model.model(
-            input_ids=None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=x,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=False,
-            return_dict=return_dict,
-            cache_position=cache_position,
-        )
-
-        hidden_states = outputs.last_hidden_state
-        logits = model.lm_head(hidden_states)
-
-        loss = None
-
-        # --- NEW Diffusion Loss Calculation ---
-        diffusion_loss = None
-        # This block is executed only if we are in a context that involves speech.
-        if speech_tensors is not None and acoustic_loss_mask.sum().item() > 0:
-            # Build conditioning mask from positions whose NEXT token is a speech latent (shift left by 1)
-            cond_mask = torch.zeros_like(acoustic_loss_mask, dtype=torch.bool)
-            cond_mask[:, :-1] = acoustic_loss_mask[:, 1:]
-            cond_mask[:, 0] = False
-            condition_features = hidden_states[cond_mask]
-
-            speech_len, latent_size = speech_features.shape
-            # Sanity check: ensure 1:1 alignment between selected conditions and latents
-            try:
-                assert (
-                    condition_features.shape[0] == speech_len
-                ), f"Mismatch: condition_features={condition_features.shape[0]} vs speech_features={speech_len}"
-            except Exception:
-                pass
-
-            noise = torch.randn(
-                (speech_len * ddmp_batch_mul, latent_size), device=hidden_states.device, dtype=hidden_states.dtype
-            )
-
-            timesteps = torch.multinomial(
-                torch.ones(model.config.diffusion_head_config.ddpm_num_steps),
-                speech_len * ddmp_batch_mul,
-                replacement=True,
-            ).to(hidden_states.device)
-
-            speech_features_repeated = speech_features.repeat_interleave(ddmp_batch_mul, dim=0)
-            condition_features_repeated = condition_features.repeat_interleave(ddmp_batch_mul, dim=0)
-
-            noisy_speech_features = model.model.noise_scheduler.add_noise(speech_features_repeated, noise, timesteps)
-
-            model_output = model.model.prediction_head(
-                noisy_speech_features, timesteps.type_as(x), condition_features_repeated
-            )
-
-            prediction_type = model.config.diffusion_head_config.prediction_type
-            if prediction_type == "epsilon":
-                target_for_loss = noise
-            elif prediction_type == "v_prediction":
-                target_for_loss = model.model.noise_scheduler.get_velocity(speech_features_repeated, noise, timesteps)
-            else:
-                raise NotImplementedError(f"Prediction type {prediction_type} not implemented")
-
-            diffusion_loss = F.mse_loss(model_output.float(), target_for_loss.float(), reduction="sum")
-            if latent_size > 0 and ddmp_batch_mul > 0:
-                # Normalize by latent dim, number of sampled diffusion steps per latent, and number of speech tokens
-                diffusion_loss = diffusion_loss / latent_size / ddmp_batch_mul / max(speech_len, 1)
-            else:
-                diffusion_loss = torch.tensor(0.0, device=diffusion_loss.device)
-
-        else:
-            # Dummy loss for DDP to work when there are no speech samples in a batch,
-            # but we are in a speech context.
-            diffusion_loss = sum(p.sum() for p in model.model.prediction_head.parameters()) * 0.0
-            diffusion_loss += sum(p.sum() for p in model.model.acoustic_connector.parameters()) * 0.0
-            diffusion_loss += sum(p.sum() for p in model.model.semantic_connector.parameters()) * 0.0
-        # --- End NEW Diffusion Loss Calculation ---
-
-        from vibevoice.modular.modeling_vibevoice import VibeVoiceCausalLMOutputWithPast
-
-        return VibeVoiceCausalLMOutputWithPast(
-            loss=loss,
-            diffusion_loss=diffusion_loss,
-            speech_token_num=speech_len if speech_tensors is not None else 0,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
 
     def compute_loss(
         self,
@@ -352,43 +194,6 @@ class VibeVoiceTrainer(Trainer):
         return (total, outputs) if return_outputs else total
 
 
-def _patch_acoustic_encode_for_legacy_indexing(model_obj, logger_):
-    try:
-        acoustic = getattr(getattr(model_obj, "model", model_obj), "acoustic_tokenizer", None)
-        if acoustic is None or not hasattr(acoustic, "encode"):
-            logger_.warning("No acoustic_tokenizer.encode() found to patch.")
-            return
-        base_encode = acoustic.encode
-
-        def encode_wrapped(*args, **kwargs):
-            out = base_encode(*args, **kwargs)
-            try:
-                _ = out[0][0]
-                return out
-            except Exception:
-                pass
-            if isinstance(out, dict):
-                for k in ("frames", "codes", "tokens", "latents", "hidden_states"):
-                    if k in out:
-                        return [[out[k]]]
-                if len(out) > 0:
-                    return [[next(iter(out.values()))]]
-            for attr in ("frames", "codes", "tokens", "latents", "hidden_states"):
-                if hasattr(out, attr):
-                    return [[getattr(out, attr)]]
-            try:
-                if isinstance(out, torch.Tensor):
-                    return [[out]]
-            except Exception:
-                pass
-            return [[out]]
-
-        acoustic.encode = encode_wrapped
-        logger_.info("Patched acoustic_tokenizer.encode() to return [[...]] for legacy indexing.")
-    except Exception as e:
-        logger_.warning(f"Failed to patch acoustic_tokenizer.encode(): {e}")
-
-
 def main() -> None:
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -423,7 +228,7 @@ def main() -> None:
 
     # Required special tokens
     tok = processor.tokenizer
-    for required in ["speech_start_id", "speech_diffusion_id", "speech_end_id"]:
+    for required in ["speech_start_id", "speech_diffusion_id", "speech_end_id", "text_start_id", "text_end_id"]:
         if not hasattr(tok, required) or getattr(tok, required) is None:
             raise RuntimeError(f"Tokenizer missing required special id: {required}")
 
@@ -439,7 +244,6 @@ def main() -> None:
         model_args.model_name_or_path,
         torch_dtype=dtype,
     )
-    _patch_acoustic_encode_for_legacy_indexing(model, logger)
 
     # Diagnostics: LM head tie
     try:
