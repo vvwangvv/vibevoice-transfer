@@ -1,4 +1,5 @@
 import io
+import logging
 import math
 import random
 import warnings
@@ -10,6 +11,8 @@ import numpy as np
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset, Sampler
+from tqdm import tqdm
 
 from vibevoice.utils import make_pad_mask
 
@@ -27,14 +30,26 @@ class VibeVoiceDataset:
         dataset: Any,
         text_column: str = "text",
         audio_column: str = "audio",
+        speaker_column: str = "speaker",
         voice_prompts_column: Optional[str] = "voice_prompts",
         force_voice_prompts: bool = False,
+        extract_speakers: bool = False,
+        fix_speaker_leakage: bool = False,
     ) -> None:
         self.dataset = dataset
         self.text_column = text_column
         self.audio_column = audio_column
+        self.speaker_column = speaker_column
         self.voice_prompts_column = voice_prompts_column
         self.force_voice_prompts = force_voice_prompts
+
+        self.speakers = set()
+        if extract_speakers:
+            for item in tqdm(self.dataset, desc="Extracting speakers from dataset..."):
+                # speakers that only do generation task during training shall not be used for understanding choices
+                if fix_speaker_leakage and item.get("generation_task_prob", 1.0) == 1.0:
+                    continue
+                self.speakers.add(item["speaker"])
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -44,49 +59,15 @@ class VibeVoiceDataset:
         data: Dict[str, Any] = {}
         data["text"] = item[self.text_column]
         data["audio"] = item[self.audio_column]
-
-        user_provided_prompt = None
-        if self.voice_prompts_column and self.voice_prompts_column in item:
-            user_provided_prompt = item[self.voice_prompts_column]
-
-        if user_provided_prompt:
-            # A prompt was provided in the dataset, so we use it.
-            if not isinstance(user_provided_prompt, list):
-                data["voice_prompts"] = [user_provided_prompt]
-            else:
-                data["voice_prompts"] = user_provided_prompt
-        else:
-            # FALLBACK: No prompt provided, so we auto-generate one from the target audio.
-            try:
-                target_sr = 24000
-                wav_array = _load_audio_to_24k(item[self.audio_column], target_sr=target_sr)
-                audio_len_seconds = len(wav_array) / target_sr
-
-                min_len_sec = min(5.0, audio_len_seconds / 4.0)
-                max_len_sec = min(15.0, audio_len_seconds / 2.0)
-
-                if min_len_sec > max_len_sec:
-                    min_len_sec = max_len_sec
-                max_len_sec = min(max_len_sec, audio_len_seconds)
-
-                if max_len_sec > 0.1:
-                    prompt_len_sec = random.uniform(min_len_sec, max_len_sec)
-                    prompt_len_samples = int(prompt_len_sec * target_sr)
-
-                    max_start_sample = len(wav_array) - prompt_len_samples
-                    start_sample = random.randint(0, max_start_sample)
-
-                    prompt_crop = wav_array[start_sample : start_sample + prompt_len_samples]
-
-                    data["voice_prompts"] = [prompt_crop]
-                else:
-                    data["voice_prompts"] = None
-
-            except Exception as e:
-                warnings.warn(f"Could not create voice prompt for item {idx}: {e}")
-                data["voice_prompts"] = None
+        data["speaker"] = item[self.speaker_column]
         data["generation_task_prob"] = item.get("generation_task_prob", 1.0)
         return data
+
+    def get_frame_len(self, idx: int) -> int:
+        item = self.dataset[idx]
+        latent_len = int(item["duration"] * 24000 // 3200)
+        text_len = item["text_len"]
+        return text_len + latent_len
 
 
 def _apply_silence_with_crossfade(
@@ -198,13 +179,17 @@ def _load_audio_from_tar(entry):
 @dataclass
 class VibeVoiceCollator:
     processor: Any  # VibeVoiceProcessor
-    max_length: Optional[int] = None
     speech_compress_ratio: int = 3200
 
     text_field: str = "text"
     audio_field: str = "audio"
+    speaker_field: str = "speaker"
     voice_prompts_field: str = "voice_prompts"
     voice_prompt_drop_rate: float = 0.0
+    voice_input_use_semantic: bool = False
+    speakers: Optional[Sequence[str]] = None
+    multiple_choice_version: int = 1  # 1: use text only; 2: use label in speaker text
+    num_choices: int = 4
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         sample_input_ids: List[List[int]] = []
@@ -212,6 +197,7 @@ class VibeVoiceCollator:
 
         sample_acoustic_input_masks: List[List[bool]] = []
         sample_semantic_input_masks: List[List[bool]] = []
+        sample_diffusion_loss_masks: List[List[bool]] = []
         sample_labels: List[List[bool]] = []
         all_speech_waveforms: List[np.ndarray] = []
         all_speech_latent_lengths: List[int] = []
@@ -219,24 +205,22 @@ class VibeVoiceCollator:
 
         for ex in features:
             text: str = ex.get(self.text_field, "")
-            voice_prompts: Optional[List[Union[str, np.ndarray, torch.Tensor]]] = ex.get(self.voice_prompts_field)
+            speaker = ex[self.speaker_field]
             audio: Union[str, np.ndarray, torch.Tensor, Dict[str, Any]] = ex.get(self.audio_field)
             generation_task_prob: float = ex.get("generation_task_prob", 1.0)
             task = "generation" if random.random() < generation_task_prob else "understanding"
 
             proc = self.processor(
                 text=[text],
-                voice_samples=(
-                    [voice_prompts]
-                    if voice_prompts is not None and random.random() >= self.voice_prompt_drop_rate
-                    else None
-                ),
                 audio=[audio],
+                speaker=[speaker],
                 task=[task],
                 padding=False,
                 truncation=False,
-                max_length=self.max_length,
                 return_tensors="pt",
+                all_speakers=self.speakers,
+                multiple_choice_version=self.multiple_choice_version,
+                num_choices=self.num_choices,
             )
 
             ids = proc["input_ids"][0].tolist()
@@ -267,8 +251,15 @@ class VibeVoiceCollator:
                 )
                 attn = attn + [1] * target_latent_len + [1]
                 acoustic_input_mask = speech_input_mask_list + [True] * target_latent_len + [False]
-                semantic_input_mask = [False] * len(speech_input_mask_list) + [True] * target_latent_len + [False]
+                if self.voice_input_use_semantic:
+                    semantic_input_mask = speech_input_mask_list + [True] * target_latent_len + [False]
+                else:
+                    semantic_input_mask = [False] * len(speech_input_mask_list) + [True] * target_latent_len + [False]
+                diffusion_loss_mask = [False] * len(speech_input_mask_list) + [True] * target_latent_len + [False]
+
             else:
+                if proc["multiple_choice_answer"][0] is not None:
+                    text = proc["multiple_choice_answer"][0]
                 text_target_ids = self.processor.tokenizer.encode(
                     text,
                     add_special_tokens=False,
@@ -276,7 +267,13 @@ class VibeVoiceCollator:
                 ids = ids + text_target_ids + [self.processor.tokenizer.text_end_id]
                 attn = attn + [1] * len(text_target_ids) + [1]
                 acoustic_input_mask = speech_input_mask_list + [False] * len(text_target_ids) + [False]
-                semantic_input_mask = [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
+                if self.voice_input_use_semantic:
+                    semantic_input_mask = speech_input_mask_list + [False] * len(text_target_ids) + [False]
+                else:
+                    semantic_input_mask = (
+                        [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
+                    )
+                diffusion_loss_mask = [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
             # Ensure text decoding sees an explicit end-of-sequence token after speech output.
             eos_token_id = getattr(self.processor.tokenizer, "eos_id", None)
             if eos_token_id is None:
@@ -287,15 +284,14 @@ class VibeVoiceCollator:
             attn.append(1)
             acoustic_input_mask.append(False)
             semantic_input_mask.append(False)
+            diffusion_loss_mask.append(False)
             labels = [-100] * prompt_len + ids[prompt_len:]
-
-            if self.max_length is not None and len(ids) > self.max_length:
-                continue
 
             sample_input_ids.append(torch.LongTensor(ids))
             sample_attention_masks.append(torch.LongTensor(attn))
             sample_acoustic_input_masks.append(torch.BoolTensor(acoustic_input_mask))
             sample_semantic_input_masks.append(torch.BoolTensor(semantic_input_mask))
+            sample_diffusion_loss_masks.append(torch.BoolTensor(diffusion_loss_mask))
             sample_labels.append(torch.LongTensor(labels))
 
         tok = self.processor.tokenizer
@@ -309,21 +305,27 @@ class VibeVoiceCollator:
         attention_mask_tensor = pad_sequence(sample_attention_masks, batch_first=True, padding_value=0)
         acoustic_input_mask_tensor = pad_sequence(sample_acoustic_input_masks, batch_first=True, padding_value=False)
         semantic_input_mask_tensor = pad_sequence(sample_semantic_input_masks, batch_first=True, padding_value=False)
+        diffusion_loss_mask_tensor = pad_sequence(sample_diffusion_loss_masks, batch_first=True, padding_value=False)
         sample_labels_tensor = pad_sequence(sample_labels, batch_first=True, padding_value=-100)
 
         # is_target waveforms should compute semantic features
-        semantic_speech_waveforms = [
-            speech_waveform
-            for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
-            if is_target
-        ]
-        if len(semantic_speech_waveforms) == 0:
-            semantic_speech_mask = semantic_speech = None
+        if self.voice_input_use_semantic:
+            semantic_speech_mask = make_pad_mask(all_speech_latent_lengths)
+            semantic_speech = pad_sequence(all_speech_waveforms, batch_first=True, padding_value=0.0)
         else:
-            semantic_speech_mask = make_pad_mask(
-                [len_ for (len_, is_target) in zip(all_speech_latent_lengths, per_segment_is_target) if is_target]
-            )
-            semantic_speech = pad_sequence(semantic_speech_waveforms, batch_first=True, padding_value=0.0)
+            semantic_speech_waveforms = [
+                speech_waveform
+                for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
+                if is_target
+            ]
+
+            if len(semantic_speech_waveforms) == 0:
+                semantic_speech_mask = semantic_speech = None
+            else:
+                semantic_speech_mask = make_pad_mask(
+                    [len_ for (len_, is_target) in zip(all_speech_latent_lengths, per_segment_is_target) if is_target]
+                )
+                semantic_speech = pad_sequence(semantic_speech_waveforms, batch_first=True, padding_value=0.0)
 
         # all waveforms compute acoustic features
         if len(all_speech_waveforms) == 0:
@@ -346,6 +348,82 @@ class VibeVoiceCollator:
             "acoustic_input_mask": acoustic_input_mask_tensor,
             "semantic_input_mask": semantic_input_mask_tensor,
             "acoustic_speech_loss_mask": acoustic_speech_loss_mask,
-            "diffusion_loss_mask": semantic_input_mask_tensor,  # loss are computed on semantic positions
+            "diffusion_loss_mask": diffusion_loss_mask_tensor,
             "labels": sample_labels_tensor,
         }
+
+
+# https://github.com/SWivid/F5-TTS/blob/605fa13b42b40e860961bac8ce30fe49f02dfa0d/src/f5_tts/model/dataset.py#L165
+class DynamicBatchSampler(Sampler):
+    """Extension of Sampler that will do the following:
+    1.  Change the batch size (essentially number of sequences)
+        in a batch to ensure that the total number of frames are less
+        than a certain threshold.
+    2.  Make sure the padding efficiency in the batch is high.
+    3.  Shuffle batches each epoch while maintaining reproducibility.
+    """
+
+    def __init__(
+        self, dataset: Dataset, frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False
+    ):
+        self.frames_threshold = frames_threshold
+        self.max_samples = max_samples
+        self.random_seed = random_seed
+        self.epoch = 0
+
+        indices, batches = [], []
+        logging.info("Sorting dataset by frame lengths... This can be slow if duration was not precomputed")
+        for idx in tqdm(range(len(dataset)), desc="Sorting dataset... "):
+            indices.append((idx, dataset.get_frame_len(idx)))
+        indices.sort(key=lambda elem: elem[1])
+
+        batch = []
+        longest_frames_in_batch = 0
+        for idx, frame_len in tqdm(
+            indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
+        ):
+            if frame_len > longest_frames_in_batch:
+                longest_frames_in_batch = frame_len
+            batch_frames = longest_frames_in_batch * (len(batch) + 1)
+
+            if batch_frames <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
+                batch.append(idx)
+            else:
+                if len(batch) > 0:
+                    batches.append(batch)
+                if frame_len <= self.frames_threshold:
+                    batch = [idx]
+                else:
+                    logging.warning(
+                        f"Single sample with {frame_len} frames exceeds the frames_threshold of {self.frames_threshold}, dropping it."
+                    )
+                    batch = []
+                    longest_frames_in_batch = 0
+
+        if not drop_residual and len(batch) > 0:
+            batches.append(batch)
+
+        del indices
+        self.batches = batches
+
+        # Ensure even batches with accelerate BatchSamplerShard cls under frame_per_batch setting
+        self.drop_last = True
+
+    def set_epoch(self, epoch: int) -> None:
+        """Sets the epoch for this sampler."""
+        self.epoch = epoch
+
+    def __iter__(self):
+        # Use both random_seed and epoch for deterministic but different shuffling per epoch
+        if self.random_seed is not None:
+            g = torch.Generator()
+            g.manual_seed(self.random_seed + self.epoch)
+            # Use PyTorch's random permutation for better reproducibility across PyTorch versions
+            indices = torch.randperm(len(self.batches), generator=g).tolist()
+            batches = [self.batches[i] for i in indices]
+        else:
+            batches = self.batches
+        return iter(batches)
+
+    def __len__(self):
+        return len(self.batches)

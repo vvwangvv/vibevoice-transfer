@@ -35,7 +35,7 @@ if __name__ == "__main__":
                 for utt in utt2wav:
                     item = {
                         "id": utt,
-                        "wav": utt2wav[utt],
+                        "audio": utt2wav[utt],
                         "text": utt2text[utt],
                         "duration": float(utt2dur[utt]),
                         "speaker": utt2spk[utt],

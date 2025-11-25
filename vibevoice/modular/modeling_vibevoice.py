@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import modeling_utils
 from transformers.activations import ACT2FN
+from transformers.generation import GenerationMixin
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -220,7 +221,7 @@ class VibeVoiceModel(VibeVoicePreTrainedModel):
         )
 
 
-class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
+class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
 
@@ -361,26 +362,28 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
 
         x = self.get_input_embeddings()(input_ids)
 
-        diffusion_speech_target = None
-        x[semantic_input_mask | acoustic_input_mask] = 0
-        if acoustic_speech is not None:
-            acoustic_tokens = self.compute_acoustic_tokens(
-                speech_tensors=acoustic_speech,
-                speech_type=kwargs.get("speech_type", "audio"),
-            )
+        if x.shape[1] == attention_mask.shape[1]:
+            # in prefill steps
+            diffusion_speech_target = None
+            x[semantic_input_mask | acoustic_input_mask] = 0
+            if acoustic_speech is not None:
+                acoustic_tokens = self.compute_acoustic_tokens(
+                    speech_tensors=acoustic_speech,
+                    speech_type=kwargs.get("speech_type", "audio"),
+                )
 
-            if torch.isnan(self.model.speech_scaling_factor) or torch.isnan(self.model.speech_bias_factor):
-                self.update_speech_scaling_factors(acoustic_tokens, acoustic_speech_mask)
-            acoustic_tokens = (acoustic_tokens + self.model.speech_bias_factor) * self.model.speech_scaling_factor
-            acoustic_connect_features = self.model.acoustic_connector(acoustic_tokens)
+                if torch.isnan(self.model.speech_scaling_factor) or torch.isnan(self.model.speech_bias_factor):
+                    self.update_speech_scaling_factors(acoustic_tokens, acoustic_speech_mask)
+                acoustic_tokens = (acoustic_tokens + self.model.speech_bias_factor) * self.model.speech_scaling_factor
+                acoustic_connect_features = self.model.acoustic_connector(acoustic_tokens)
 
-            x[acoustic_input_mask] += acoustic_connect_features[acoustic_speech_mask]
-            diffusion_speech_target = acoustic_tokens[acoustic_speech_loss_mask]
+                x[acoustic_input_mask] += acoustic_connect_features[acoustic_speech_mask]
+                diffusion_speech_target = acoustic_tokens[acoustic_speech_loss_mask]
 
-        if semantic_speech is not None:
-            semantic_tokens = self.compute_semantic_tokens(speech_tensors=semantic_speech)
-            semantic_connect_features = self.model.semantic_connector(semantic_tokens)
-            x[semantic_input_mask] += semantic_connect_features[semantic_speech_mask]
+            if semantic_speech is not None:
+                semantic_tokens = self.compute_semantic_tokens(speech_tensors=semantic_speech)
+                semantic_connect_features = self.model.semantic_connector(semantic_tokens)
+                x[semantic_input_mask] += semantic_connect_features[semantic_speech_mask]
 
         outputs = self.model(
             input_ids=None,
@@ -405,7 +408,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         # --- Diffusion Loss Calculation ---
         diffusion_loss = None
         # This block is executed only if we are in a context that involves speech.
-        if diffusion_loss_mask.sum() > 0:
+        if diffusion_loss_mask is not None and diffusion_loss_mask.sum() > 0:
             diffusion_loss = self.compute_diffusion_loss(
                 hidden_states,
                 diffusion_speech_target,
@@ -413,10 +416,6 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
                 ddpm_batch_mul,
             )
         # --- End Diffusion Loss Calculation ---
-
-        if not return_dict:
-            output = (logits,) + outputs.to_tuple()[1:]
-            return (loss, diffusion_loss) + output
 
         return VibeVoiceCausalLMOutputWithPast(
             loss=loss,

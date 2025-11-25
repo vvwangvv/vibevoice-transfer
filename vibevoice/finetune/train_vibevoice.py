@@ -1,18 +1,25 @@
 # train_vibevoice_lora.py
+import json
 import logging
-import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import DatasetDict, VerificationMode, load_dataset
+from datasets import VerificationMode, load_dataset
+from torch.utils.data import DataLoader, SequentialSampler
+from tqdm import tqdm
 from transformers import HfArgumentParser, Trainer, TrainerCallback
 from transformers import TrainingArguments as HfTrainingArguments
 from transformers import set_seed
 
-from vibevoice.finetune.data_vibevoice import VibeVoiceCollator, VibeVoiceDataset
+from vibevoice.finetune.data_vibevoice import (
+    DynamicBatchSampler,
+    VibeVoiceCollator,
+    VibeVoiceDataset,
+)
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
@@ -126,16 +133,26 @@ class DataArguments:
     voice_prompts_column_name: Optional[str] = field(default="voice_prompts")
     eval_split_size: float = field(default=0.0)
     ignore_verifications: bool = field(default=False)
-    max_length: Optional[int] = field(default=None)
-    train_jsonl: Optional[str] = field(
+    train_jsonl: Optional[Path] = field(
         default=None, metadata={"help": "Path to local train JSONL with {text, audio, [voice_prompts]}"}
     )
-    validation_jsonl: Optional[str] = field(default=None, metadata={"help": "Optional path to local validation JSONL"})
+    validation_jsonl: Optional[Path] = field(default=None, metadata={"help": "Optional path to local validation JSONL"})
+    voice_input_use_semantic: bool = field(default=False)
     voice_prompt_drop_rate: float = field(
         default=0.0,
         metadata={
             "help": "Probability to drop conditioning voice prompt during training (0.0 keep always, 1.0 drop always)."
         },
+    )
+    use_multiple_choice_for_understanding: bool = field(
+        default=False, metadata={"help": "Use multi-choice understanding task during training."}
+    )
+    multiple_choice_version: int = field(
+        default=1, metadata={"help": "version 1: only ABCD; version 2: A <Speaker>; version 3: A<Speaker> Transcript"}
+    )
+    num_choices: int = field(default=4, metadata={"help": "number of choices for multiple choice task"})
+    fix_speaker_leakage: bool = field(
+        default=False, metadata={"help": "Fix speaker leakage in multiple choice task (if applicable)."}
     )
 
 
@@ -144,6 +161,8 @@ class CustomTrainingArguments(HfTrainingArguments):
     ddpm_batch_mul: int = field(default=1)
     ce_loss_weight: float = field(default=1.0)
     diffusion_loss_weight: float = field(default=1.0)
+    per_device_train_max_samples: Optional[int] = field(default=None)
+    per_device_train_max_tokens: Optional[int] = field(default=None)
     gradient_clipping: bool = field(
         default=False,
         metadata={
@@ -182,6 +201,7 @@ class VibeVoiceTrainer(Trainer):
         prefix = "train" if model.training else "eval"
         self.log(
             {
+                f"{prefix}/batch_size": logits.size(0),
                 f"{prefix}/ce_loss": ce_loss.detach().item(),
                 f"{prefix}/diffusion_loss": diffusion_loss.detach().item(),
             }
@@ -192,6 +212,24 @@ class VibeVoiceTrainer(Trainer):
                 self.log({"train/learning_rate_real": float(lr_val)})
 
         return (total, outputs) if return_outputs else total
+
+    def get_train_dataloader(self):
+        self.accelerator.even_batches = False
+        batch_sampler = DynamicBatchSampler(
+            self.train_dataset,
+            self.args.per_device_train_max_tokens,
+            max_samples=self.args.per_device_train_max_samples,
+            random_seed=self.args.seed,
+            drop_residual=False,
+        )
+        train_dataloader = DataLoader(
+            self.train_dataset,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            batch_sampler=batch_sampler,
+        )
+        train_dataloader = self.accelerator.prepare(train_dataloader)
+        return train_dataloader
 
 
 def main() -> None:
@@ -400,12 +438,16 @@ def main() -> None:
     # Datasets
     verification_mode = VerificationMode.NO_CHECKS if data_args.ignore_verifications else VerificationMode.BASIC_CHECKS
     if data_args.train_jsonl is not None:
-        data_files: Dict[str, str] = {"train": data_args.train_jsonl}
+        raw = {"train": [], "validation": []}
+        with data_args.train_jsonl.open("r") as f:
+            for line in tqdm(f, desc="Loading train JSONL"):
+                if line.strip():
+                    raw["train"].append(json.loads(line))
         if data_args.validation_jsonl is not None:
-            data_files["validation"] = data_args.validation_jsonl
-        raw = load_dataset(
-            "json", data_files=data_files, verification_mode=verification_mode, cache_dir=model_args.cache_dir
-        )
+            with data_args.validation_jsonl.open("r") as f:
+                for line in tqdm(f, desc="Loading validation JSONL"):
+                    if line.strip():
+                        raw["validation"].append(json.loads(line))
     else:
         if data_args.dataset_name is None:
             raise ValueError(
@@ -431,6 +473,8 @@ def main() -> None:
         text_column=data_args.text_column_name,
         audio_column=data_args.audio_column_name,
         voice_prompts_column=data_args.voice_prompts_column_name,
+        extract_speakers=data_args.use_multiple_choice_for_understanding,
+        fix_speaker_leakage=data_args.fix_speaker_leakage,
     )
     eval_dataset = None
     if eval_ds is not None:
@@ -445,9 +489,12 @@ def main() -> None:
     speech_compress_ratio = getattr(processor, "speech_tok_compress_ratio", 3200)
     data_collator = VibeVoiceCollator(
         processor=processor,
-        max_length=data_args.max_length,
         speech_compress_ratio=speech_compress_ratio,
         voice_prompt_drop_rate=data_args.voice_prompt_drop_rate,
+        voice_input_use_semantic=data_args.voice_input_use_semantic,
+        speakers=train_dataset.speakers,
+        multiple_choice_version=data_args.multiple_choice_version,
+        num_choices=data_args.num_choices,
     )
 
     ema_cb = EmaCallback(attr_path="model.prediction_head", decay=0.999, device="cpu")
@@ -467,10 +514,7 @@ def main() -> None:
 
     # Optional debug pre-training save
     if getattr(training_args, "gradient_checkpointing", False):
-        try:
-            model.gradient_checkpointing_enable()
-        except Exception:
-            logger.warning("Failed to enable gradient checkpointing on the model.")
+        model.gradient_checkpointing_enable()
 
     if training_args.do_train:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)

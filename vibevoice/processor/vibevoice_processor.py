@@ -1,8 +1,9 @@
 import math
 import os
+import random
 import re
 import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -197,13 +198,17 @@ class VibeVoiceProcessor:
             Union[str, List[str], TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]
         ] = None,
         audio: Optional[Union[np.ndarray, str, List[Union[np.ndarray, str]]]] = None,
-        voice_samples: Optional[Union[List[Union[str, np.ndarray]], List[List[Union[str, np.ndarray]]]]] = None,
+        speaker: Optional[
+            Union[str, List[str], TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]
+        ] = None,
         task: Optional[Union[str, List[str]]] = None,
         padding: Union[bool, str, PaddingStrategy] = True,
         truncation: Union[bool, str, TruncationStrategy] = False,
-        max_length: Optional[int] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
         return_attention_mask: bool = True,
+        all_speakers: Optional[Set[str]] = None,
+        multiple_choice_version: int = 1,
+        num_choices: int = 4,
         **kwargs,
     ) -> BatchEncoding:
         """
@@ -228,8 +233,6 @@ class VibeVoiceProcessor:
                 Whether to pad sequences to the same length
             truncation (`bool`, `str` or `TruncationStrategy`, defaults to `False`):
                 Whether to truncate sequences
-            max_length (`int`, *optional*):
-                Maximum length of the returned sequences
             return_tensors (`str` or `TensorType`, *optional*):
                 If set, will return tensors of a particular framework
             return_attention_mask (`bool`, defaults to `True`):
@@ -239,57 +242,26 @@ class VibeVoiceProcessor:
             `BatchEncoding`: A BatchEncoding with the following fields:
                 - **input_ids** -- List of token id sequences or tensor
                 - **attention_mask** -- List of attention masks or tensor
-                - **speech_tensors** -- Padded speech inputs (if voice_samples provided)
-                - **speech_masks** -- Speech masks (if voice_samples provided)
+                - **speech_tensors** -- Padded speech inputs
+                - **speech_masks** -- Speech masks
                 - **speech_input_mask** -- Boolean masks indicating speech token positions
         """
         # Handle single vs batch input
-        if isinstance(text, str) or (isinstance(text, list) and len(text) > 0 and not isinstance(text[0], str)):
+        if not isinstance(text, list) and not isinstance(audio, list):
             # Single input
-            texts, audios, tasks = [text], [audio], [task]
-            is_batched = False
+            texts, audios, speakers, tasks = [text], [audio], [speaker], [task]
         else:
-            # Batch input
-            texts, audios, tasks = text, audio, task
-            is_batched = True
-
-        # Handle voice samples
-        if voice_samples is not None:
-            if not is_batched or (isinstance(voice_samples[0], (str, np.ndarray))):
-                # Single set of voice samples
-                voice_samples_list = [voice_samples]
-            else:
-                # Batch of voice samples
-                voice_samples_list = voice_samples
-        else:
-            voice_samples_list = [None] * len(texts)
+            texts, audios, speakers, tasks = text, audio, speaker, task
 
         # Process each input
         all_encodings = []
-        for text_input, audio_input, voice_input, task in zip(texts, audios, voice_samples_list, tasks):
-            script = None
-            if isinstance(text_input, str):
-                # Check if it's a file path
-                if text_input.endswith(".json") and os.path.exists(text_input):
-                    script = self._convert_json_to_script(text_input)
-                elif text_input.endswith(".txt") and os.path.exists(text_input):
-                    script = self._convert_text_input_to_script(text_input)
-                else:
-                    # Assume it's the script content directly
-                    script = text_input
-
-            if script is None:
-                raise ValueError(f"Could not process input text_input: {text_input}")
-            text_input = self._parse_script(script)
-            if voice_input is not None:
-                voice_input = [(speaker, input_) for (speaker, _), input_ in zip(text_input, voice_input)]
-            else:
-                voice_input = None
-
+        for text_input, audio_input, speaker, task in zip(texts, audios, speakers, tasks):
             if task == "generation":
-                encoding = self._process_single_for_generation(text_input, voice_input)
+                encoding = self._process_single_for_generation(text_input, speaker)
             else:
-                encoding = self._process_single_for_understanding(audio_input, voice_input)
+                encoding = self._process_single_for_understanding(
+                    audio_input, speaker, all_speakers, multiple_choice_version, num_choices
+                )
             all_encodings.append(encoding)
 
         # Combine batch
@@ -297,46 +269,35 @@ class VibeVoiceProcessor:
             all_encodings,
             padding=padding,
             truncation=truncation,
-            max_length=max_length,
             return_tensors=return_tensors,
             return_attention_mask=return_attention_mask,
         )
+        batch_encoding["multiple_choice_answer"] = [enc.get("multiple_choice_answer", None) for enc in all_encodings]
         return batch_encoding
 
     def _process_single_for_generation(
         self,
-        # text: Union[str, TextInput],
-        parsed_lines: Tuple[str, str],
-        voice_samples: Optional[List[Union[str, np.ndarray]]] = None,
+        text: str,
+        speaker: str,
     ) -> Dict[str, Any]:
         """Process a single podcast script."""
         # Determine if text is a file path or direct script
-        all_speakers = list(set(speaker_id for speaker_id, _ in parsed_lines))
 
         # Create system prompt
         # system_tokens = self.tokenizer.encode(self.system_prompt, add_special_tokens=False)
         system_tokens = self.tokenizer.encode(self.system_prompt_for_generation)
 
-        # Process voice samples if provided
-        if voice_samples:
-            voice_tokens, voice_speech_inputs, voice_speech_masks = self._create_voice_prompt(voice_samples)
-        else:
-            voice_tokens, voice_speech_inputs, voice_speech_masks = [], [], []
-
         # Build full token sequence
-        full_tokens = system_tokens + voice_tokens
-        speech_input_mask = [False] * len(system_tokens) + voice_speech_masks
+        full_tokens = system_tokens
+        speech_input_mask = [False] * len(system_tokens)
 
         # Add text input section
         full_tokens += self.tokenizer.encode(" Text input:\n", add_special_tokens=False)
         speech_input_mask += [False] * len(self.tokenizer.encode(" Text input:\n", add_special_tokens=False))
 
-        for speaker_id, speaker_text in parsed_lines:
-            speaker_text_tokens = self.tokenizer.encode(
-                f" Speaker {speaker_id}:{speaker_text}\n", add_special_tokens=False
-            )
-            full_tokens += speaker_text_tokens
-            speech_input_mask += [False] * len(speaker_text_tokens)
+        speaker_text_tokens = self.tokenizer.encode(f" Speaker {speaker}:{text}\n", add_special_tokens=False)
+        full_tokens += speaker_text_tokens
+        speech_input_mask += [False] * len(speaker_text_tokens)
 
         # Add speech output section
         full_tokens += self.tokenizer.encode(" Speech output:\n", add_special_tokens=False) + [
@@ -346,35 +307,41 @@ class VibeVoiceProcessor:
 
         return {
             "input_ids": full_tokens,
-            "speech_inputs": voice_speech_inputs if voice_speech_inputs else None,
+            "speech_inputs": None,
             "speech_input_mask": speech_input_mask,
-            "parsed_script": parsed_lines,
-            "all_speakers": all_speakers,
         }
 
     def _process_single_for_understanding(
         self,
         audio: Union[str, AudioInput],
-        voice_samples: Optional[List[Tuple[str, Union[str, np.ndarray]]]] = None,
+        speaker: Optional[str] = None,
+        all_speakers: Optional[Set[str]] = None,
+        multiple_choice_version: int = 1,
+        num_choices: int = 4,
     ) -> Dict[str, Any]:
+        """
+        multiple_choice_version = 1: choice
+        multiple_choice_version = 2: choice + speaker name
+        multiple_choice_version = 3: 50% = 2; 50% = transcription
+        """
+
+        assert audio is not None, "Audio input is required for understanding task."
         """Process a single podcast script."""
-        all_speakers = list(set(speaker_id for speaker_id, _ in voice_samples)) if voice_samples else None
 
-        # Create system prompt
-        # system_tokens = self.tokenizer.encode(self.system_prompt, add_special_tokens=False)
-        system_tokens = self.tokenizer.encode(self.system_prompt_for_understanding)
+        if multiple_choice_version == 3 and random.random() < 0.5:
+            all_speakers = None
 
-        # Process voice samples if provided
-        if voice_samples:
-            voice_tokens, voice_speech_inputs, voice_speech_masks = self._create_voice_prompt(voice_samples)
+        use_multiple_choice = all_speakers is not None and len(all_speakers) != 0
+        if use_multiple_choice:
+            system_tokens = self.tokenizer.encode("Listen to the following speech and answer the question.\n")
         else:
-            voice_tokens, voice_speech_inputs, voice_speech_masks = [], [], []
+            system_tokens = self.tokenizer.encode(self.system_prompt_for_understanding)
 
         # Build full token sequence
-        full_tokens = system_tokens + voice_tokens
-        speech_input_mask = [False] * len(system_tokens) + voice_speech_masks
+        full_tokens = system_tokens
+        speech_input_mask = [False] * len(system_tokens)
 
-        # Add text input section
+        # Add speech input section
         full_tokens += self.tokenizer.encode(" Speech input:\n", add_special_tokens=False)
         speech_input_mask += [False] * len(self.tokenizer.encode(" Speech input:\n", add_special_tokens=False))
 
@@ -382,26 +349,38 @@ class VibeVoiceProcessor:
         full_tokens += speech_tokens
         speech_input_mask += speech_mask
 
-        # Add speech output section
-        full_tokens += self.tokenizer.encode(" Text output:\n", add_special_tokens=False) + [
-            self.tokenizer.text_start_id
-        ]
-        speech_input_mask += [False] * (len(self.tokenizer.encode(" Text output:\n", add_special_tokens=False)) + 1)
+        if use_multiple_choice:
+            choice_tokens, multiple_choice_answer = self._create_multi_choice_prompt(
+                all_speakers, answer=speaker, num_choices=num_choices
+            )
+            full_tokens += choice_tokens
+            speech_input_mask += [False] * len(choice_tokens)
 
-        return {
-            "input_ids": full_tokens,
-            "speech_inputs": voice_speech_inputs + [wav],
-            "speech_input_mask": speech_input_mask,
-            "parsed_script": None,
-            "all_speakers": all_speakers,
-        }
+            if multiple_choice_version == 2:
+                multiple_choice_answer += f".{speaker}"
+
+            return {
+                "input_ids": full_tokens,
+                "speech_inputs": [wav],
+                "speech_input_mask": speech_input_mask,
+                "multiple_choice_answer": multiple_choice_answer,
+            }
+        else:
+            question_tokens = self._create_speaker_prompt()
+            full_tokens += question_tokens
+            speech_input_mask += [False] * len(question_tokens)
+            return {
+                "input_ids": full_tokens,
+                "speech_inputs": [wav],
+                "speech_input_mask": speech_input_mask,
+                "multiple_choice_answer": speaker,
+            }
 
     def _batch_encode(
         self,
         encodings: List[Dict[str, Any]],
         padding: Union[bool, str, PaddingStrategy] = True,
         truncation: Union[bool, str, TruncationStrategy] = False,
-        max_length: Optional[int] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
         return_attention_mask: bool = True,
     ) -> BatchEncoding:
@@ -420,12 +399,7 @@ class VibeVoiceProcessor:
 
         # Apply padding to input_ids
         if padding_strategy != PaddingStrategy.DO_NOT_PAD:
-            if padding_strategy == PaddingStrategy.LONGEST:
-                max_len = max(len(ids) for ids in input_ids_list)
-            elif padding_strategy == PaddingStrategy.MAX_LENGTH and max_length is not None:
-                max_len = max_length
-            else:
-                max_len = max(len(ids) for ids in input_ids_list)
+            max_len = max(len(ids) for ids in input_ids_list)
 
             # Pad sequences
             padded_input_ids = []
@@ -490,35 +464,50 @@ class VibeVoiceProcessor:
             batch_encoding["speech_tensors"] = None
             batch_encoding["speech_masks"] = None
 
-        # Add metadata
-        batch_encoding["parsed_scripts"] = [enc["parsed_script"] for enc in encodings]
-        batch_encoding["all_speakers_list"] = [enc["all_speakers"] for enc in encodings]
-
         return batch_encoding
 
-    def _create_voice_prompt(
-        self, speaker_samples: List[Tuple[str, Union[str, np.ndarray]]]
-    ) -> Tuple[List[int], List[np.ndarray], List[bool]]:
+    def _create_transcribe_prompt(self) -> List[int]:
+        question = "What did the previous speech say? The transcription is: "
+        question_tokens = self.tokenizer.encode(question, add_special_tokens=False)
+        return question_tokens
+
+    def _create_speaker_prompt(self) -> List[int]:
         """
-        Create voice prompt tokens and process audio samples.
+        Create multi-choice prompt tokens.
 
         Returns:
-            tuple: (voice_tokens, voice_speech_inputs, voice_speech_masks)
+            tuple: (choice_tokens, choice_speech_inputs, choice_speech_masks)
         """
-        voice_full_tokens = self.tokenizer.encode(" Voice input:\n", add_special_tokens=False)
-        voice_speech_inputs = []
-        voice_speech_masks = [False] * len(voice_full_tokens)
+        question = "Who spoke the previous speech? "
+        question_full_tokens = self.tokenizer.encode(question, add_special_tokens=False)
+        return question_full_tokens
 
-        for speaker_id, speaker_audio in speaker_samples:
-            prefix_tokens = self.tokenizer.encode(f" Speaker {speaker_id}:", add_special_tokens=False)
-            speaker_tokens, wav, speaker_speech_masks = self.prepare_speech_input(speaker_audio)
+    def _create_multi_choice_prompt(self, speakers: Set[str], answer: str, num_choices: int = 4) -> List[int]:
+        """
+        Create multi-choice prompt tokens.
 
-            vae_input_mask = [False] * len(prefix_tokens) + speaker_speech_masks
-            voice_full_tokens.extend(prefix_tokens + speaker_tokens)
-            voice_speech_masks.extend(vae_input_mask)
-            voice_speech_inputs.append(wav)
+        Returns:
+            tuple: (choice_tokens, choice_speech_inputs, choice_speech_masks)
+        """
+        question = "Who spoke the previous speech? Choices: "
 
-        return voice_full_tokens, voice_speech_inputs, voice_speech_masks
+        choices = random.sample(list(speakers - {answer}), k=num_choices - 1)
+        choices.append(answer)
+        random.shuffle(choices)
+
+        answer_choice = None
+        indices = "ABCDEFGHIJK"
+        for index, speaker in zip(indices, choices):
+            question += f"{index}.{speaker}; "
+            if speaker == answer:
+                answer_choice = index
+
+        question += "The answer is "
+        # A.spkid
+        # A
+
+        question_full_tokens = self.tokenizer.encode(question, add_special_tokens=False)
+        return question_full_tokens, answer_choice
 
     def prepare_speech_input(self, speech: Union[str, np.ndarray]) -> Tuple[List[int], List[np.ndarray], List[bool]]:
         """
@@ -681,33 +670,6 @@ class VibeVoiceProcessor:
             raise ValueError("No valid content found in text file")
 
         return "\n".join(script_lines)
-
-    def _parse_script(self, script: str) -> List[Tuple[int, str]]:
-        """Parse script into list of (speaker_id, text) tuples."""
-        lines = script.strip().split("\n")
-        parsed_lines = []
-        speaker_ids = []
-
-        # First pass: parse all lines and collect speaker IDs
-        for line in lines:
-            if not line.strip():
-                continue
-
-            # Use regex to handle edge cases like multiple colons
-            match = re.match(r"^Speaker\s+([\d\w]+)\s*:\s*(.*)$", line.strip(), re.IGNORECASE)
-
-            if match:
-                speaker_id = match.group(1)
-                text = " " + match.group(2).strip()
-                parsed_lines.append((speaker_id, text))
-                speaker_ids.append(speaker_id)
-            else:
-                logger.warning(f"Could not parse line: '{line}'")
-
-        if not parsed_lines:
-            raise ValueError("No valid speaker lines found in script")
-
-        return parsed_lines
 
     def _merge_inputs(self, text_inputs: BatchEncoding, audio_inputs: Dict) -> BatchEncoding:
         """Merge text and audio inputs into a single BatchEncoding."""

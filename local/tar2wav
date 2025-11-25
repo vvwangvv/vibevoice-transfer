@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+
+import sys
+
+import torchaudio
+
+source = sys.argv[1]
+target = sys.argv[2]
+
+
+def _load_audio_from_tar(entry):
+    tar_path, offset, size = entry.split(":")
+    offset, size = int(offset), int(size)
+
+    with open(tar_path, "rb") as f:
+        f.seek(offset)
+        audio_bytes = f.read(size)
+    try:
+        audio, sr = torchaudio.load(io.BytesIO(audio_bytes))
+    except:
+        audio, sr = torchaudio.load(io.BytesIO(audio_bytes), format="mp3")
+
+    return audio, sr
+
+if __name__ == "__main__":
+    audio, sr = _load_audio_from_tar(source)
+    torchaudio.save(target, audio, sr)
