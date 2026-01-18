@@ -137,22 +137,25 @@ class DataArguments:
         default=None, metadata={"help": "Path to local train JSONL with {text, audio, [voice_prompts]}"}
     )
     validation_jsonl: Optional[Path] = field(default=None, metadata={"help": "Optional path to local validation JSONL"})
-    voice_input_use_semantic: bool = field(default=False)
+    voice_input_use_semantic: bool = field(
+        default=False,
+        metadata={
+            "help": "the priority is lower than generation_use_semantic_only and understanding_use_semantic_only"
+        },
+    )
     voice_prompt_drop_rate: float = field(
         default=0.0,
         metadata={
             "help": "Probability to drop conditioning voice prompt during training (0.0 keep always, 1.0 drop always)."
         },
     )
-    use_multiple_choice_for_understanding: bool = field(
-        default=False, metadata={"help": "Use multi-choice understanding task during training."}
-    )
-    multiple_choice_version: int = field(
-        default=1, metadata={"help": "version 1: only ABCD; version 2: A <Speaker>; version 3: A<Speaker> Transcript"}
-    )
+    multiple_choice_version: int = field(default=2, metadata={"help": "version 1: only ABCD; version 2: A <Speaker>;"})
     num_choices: int = field(default=4, metadata={"help": "number of choices for multiple choice task"})
-    fix_speaker_leakage: bool = field(
-        default=False, metadata={"help": "Fix speaker leakage in multiple choice task (if applicable)."}
+    understanding_use_semantic_only: bool = field(
+        default=False, metadata={"help": "Use mismatched acoustic/semantic representation for voice prompts"}
+    )
+    generation_use_semantic_only: bool = field(
+        default=False, metadata={"help": "Use mismatched acoustic/semantic representation for voice prompts"}
     )
 
 
@@ -282,6 +285,14 @@ def main() -> None:
         model_args.model_name_or_path,
         torch_dtype=dtype,
     )
+
+    if data_args.generation_use_semantic_only:
+        model.model.prediction_head.noisy_images_proj = nn.Linear(
+            model.config.semantic_tokenizer_config.vae_dim, model.config.decoder_config.hidden_size, bias=False
+        )
+        model.model.prediction_head.final_layer.linear = nn.Linear(
+            model.config.decoder_config.hidden_size, model.config.semantic_tokenizer_config.vae_dim, bias=False
+        )
 
     # Diagnostics: LM head tie
     try:
@@ -473,8 +484,6 @@ def main() -> None:
         text_column=data_args.text_column_name,
         audio_column=data_args.audio_column_name,
         voice_prompts_column=data_args.voice_prompts_column_name,
-        extract_speakers=data_args.use_multiple_choice_for_understanding,
-        fix_speaker_leakage=data_args.fix_speaker_leakage,
     )
     eval_dataset = None
     if eval_ds is not None:
@@ -495,6 +504,8 @@ def main() -> None:
         speakers=train_dataset.speakers,
         multiple_choice_version=data_args.multiple_choice_version,
         num_choices=data_args.num_choices,
+        generation_use_semantic_only=data_args.generation_use_semantic_only,
+        understanding_use_semantic_only=data_args.understanding_use_semantic_only,
     )
 
     ema_cb = EmaCallback(attr_path="model.prediction_head", decay=0.999, device="cpu")

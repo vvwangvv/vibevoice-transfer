@@ -36,6 +36,22 @@ def parse_args():
         help="Number of choices for multiple choice task",
     )
     parser.add_argument(
+        "--understanding-use-semantic-only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--generation-use-semantic-only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--voice-input-no-semantic",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--switch-semantic-acoustic",
+        action="store_true",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         required=True,
@@ -109,7 +125,7 @@ def main():
                 return_attention_mask=True,
                 all_speakers=set(all_speakers),
                 speaker=speaker_ref,
-                multiple_choice_version=1,
+                multiple_choice_version=2,
                 num_choices=args.n_choices,
             )
 
@@ -118,17 +134,48 @@ def main():
                 if torch.is_tensor(v):
                     inputs[k] = v.to("cuda")
 
-            # Generate audio
+            # Generate audioj j j
             start_time = time.time()
             for key in ["parsed_scripts", "all_speakers_list"]:
                 inputs.pop(key, None)
             answer = inputs.pop("multiple_choice_answer", None)
 
             dtype = next(model.parameters()).dtype
-            inputs["acoustic_input_mask"] = inputs.pop("speech_input_mask")
-            inputs["semantic_input_mask"] = torch.zeros_like(inputs["acoustic_input_mask"]).bool()
-            inputs["acoustic_speech"] = inputs.pop("speech_tensors").to(dtype)
-            inputs["acoustic_speech_mask"] = inputs.pop("speech_masks")
+            inputs["speech_tensors"] = inputs["speech_tensors"].to(dtype)
+
+            if args.generation_use_semantic_only:
+                inputs["acoustic_input_mask"] = inputs["speech_input_mask"]
+                inputs["acoustic_speech"] = inputs["speech_tensors"]
+                inputs["acoustic_speech_mask"] = inputs["speech_masks"]
+            elif args.understanding_use_semantic_only:
+                inputs["acoustic_input_mask"] = torch.zeros_like(inputs["speech_input_mask"]).to("cuda")
+                inputs["acoustic_speech"] = None
+                inputs["acoustic_speech_mask"] = None
+            else:
+                inputs["acoustic_input_mask"] = inputs["speech_input_mask"]
+                inputs["acoustic_speech"] = inputs["speech_tensors"]
+                inputs["acoustic_speech_mask"] = inputs["speech_masks"]
+
+            if args.voice_input_no_semantic:
+                inputs["semantic_input_mask"] = torch.zeros_like(inputs["speech_input_mask"]).to("cuda")
+                inputs["semantic_speech"] = None
+                inputs["semantic_speech_mask"] = None
+            elif args.generation_use_semantic_only:
+                # understanding not using semantic
+                inputs["semantic_input_mask"] = torch.zeros_like(inputs["speech_input_mask"]).to("cuda")
+                inputs["semantic_speech"] = None
+                inputs["semantic_speech_mask"] = None
+            elif args.understanding_use_semantic_only:
+                inputs["semantic_input_mask"] = inputs["speech_input_mask"]
+                inputs["semantic_speech"] = inputs["speech_tensors"]
+                inputs["semantic_speech_mask"] = inputs["speech_masks"]
+            else:
+                inputs["semantic_input_mask"] = inputs["speech_input_mask"]
+                inputs["semantic_speech"] = inputs["speech_tensors"]
+                inputs["semantic_speech_mask"] = inputs["speech_masks"]
+            inputs.pop("speech_input_mask")
+            inputs.pop("speech_tensors")
+            inputs.pop("speech_masks")
 
             suppress_tokens = [
                 processor.tokenizer.speech_diffusion_id,
@@ -137,7 +184,7 @@ def main():
             ]
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=20,
+                max_new_tokens=15,
                 eos_token_id=processor.tokenizer.text_end_id,
                 suppress_tokens=suppress_tokens,
                 tokenizer=processor.tokenizer,
@@ -158,7 +205,7 @@ def main():
                 choice_answer = generated_text.split("Bit")[0]
                 speaker_answer = ""
 
-            choice_ref = answer[0]
+            choice_ref = answer[0].split(".")[0]
 
             if choice_answer == choice_ref:
                 correct_choice += 1

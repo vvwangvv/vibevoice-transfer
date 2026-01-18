@@ -207,7 +207,7 @@ class VibeVoiceProcessor:
         return_tensors: Optional[Union[str, TensorType]] = None,
         return_attention_mask: bool = True,
         all_speakers: Optional[Set[str]] = None,
-        multiple_choice_version: int = 1,
+        multiple_choice_version: int = 2,
         num_choices: int = 4,
         **kwargs,
     ) -> BatchEncoding:
@@ -316,26 +316,18 @@ class VibeVoiceProcessor:
         audio: Union[str, AudioInput],
         speaker: Optional[str] = None,
         all_speakers: Optional[Set[str]] = None,
-        multiple_choice_version: int = 1,
+        multiple_choice_version: int = 2,
         num_choices: int = 4,
     ) -> Dict[str, Any]:
         """
         multiple_choice_version = 1: choice
         multiple_choice_version = 2: choice + speaker name
-        multiple_choice_version = 3: 50% = 2; 50% = transcription
         """
 
         assert audio is not None, "Audio input is required for understanding task."
         """Process a single podcast script."""
 
-        if multiple_choice_version == 3 and random.random() < 0.5:
-            all_speakers = None
-
-        use_multiple_choice = all_speakers is not None and len(all_speakers) != 0
-        if use_multiple_choice:
-            system_tokens = self.tokenizer.encode("Listen to the following speech and answer the question.\n")
-        else:
-            system_tokens = self.tokenizer.encode(self.system_prompt_for_understanding)
+        system_tokens = self.tokenizer.encode("Listen to the following speech and answer the question.\n")
 
         # Build full token sequence
         full_tokens = system_tokens
@@ -349,32 +341,21 @@ class VibeVoiceProcessor:
         full_tokens += speech_tokens
         speech_input_mask += speech_mask
 
-        if use_multiple_choice:
-            choice_tokens, multiple_choice_answer = self._create_multi_choice_prompt(
-                all_speakers, answer=speaker, num_choices=num_choices
-            )
-            full_tokens += choice_tokens
-            speech_input_mask += [False] * len(choice_tokens)
+        choice_tokens, multiple_choice_answer = self._create_multi_choice_prompt(
+            all_speakers, answer=speaker, num_choices=num_choices
+        )
+        full_tokens += choice_tokens
+        speech_input_mask += [False] * len(choice_tokens)
 
-            if multiple_choice_version == 2:
-                multiple_choice_answer += f".{speaker}"
+        if multiple_choice_version == 2:
+            multiple_choice_answer += f".{speaker}"
 
-            return {
-                "input_ids": full_tokens,
-                "speech_inputs": [wav],
-                "speech_input_mask": speech_input_mask,
-                "multiple_choice_answer": multiple_choice_answer,
-            }
-        else:
-            question_tokens = self._create_speaker_prompt()
-            full_tokens += question_tokens
-            speech_input_mask += [False] * len(question_tokens)
-            return {
-                "input_ids": full_tokens,
-                "speech_inputs": [wav],
-                "speech_input_mask": speech_input_mask,
-                "multiple_choice_answer": speaker,
-            }
+        return {
+            "input_ids": full_tokens,
+            "speech_inputs": [wav],
+            "speech_input_mask": speech_input_mask,
+            "multiple_choice_answer": multiple_choice_answer,
+        }
 
     def _batch_encode(
         self,

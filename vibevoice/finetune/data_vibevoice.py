@@ -33,8 +33,6 @@ class VibeVoiceDataset:
         speaker_column: str = "speaker",
         voice_prompts_column: Optional[str] = "voice_prompts",
         force_voice_prompts: bool = False,
-        extract_speakers: bool = False,
-        fix_speaker_leakage: bool = False,
     ) -> None:
         self.dataset = dataset
         self.text_column = text_column
@@ -44,12 +42,10 @@ class VibeVoiceDataset:
         self.force_voice_prompts = force_voice_prompts
 
         self.speakers = set()
-        if extract_speakers:
-            for item in tqdm(self.dataset, desc="Extracting speakers from dataset..."):
-                # speakers that only do generation task during training shall not be used for understanding choices
-                if fix_speaker_leakage and item.get("generation_task_prob", 1.0) == 1.0:
-                    continue
-                self.speakers.add(item["speaker"])
+        for item in tqdm(self.dataset, desc="Extracting candidate speakers from dataset..."):
+            if item.get("generation_task_prob", 1.0) == 1.0:
+                continue
+            self.speakers.add(item["speaker"])
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -187,8 +183,10 @@ class VibeVoiceCollator:
     voice_prompts_field: str = "voice_prompts"
     voice_prompt_drop_rate: float = 0.0
     voice_input_use_semantic: bool = False
+    generation_use_semantic_only: bool = False
+    understanding_use_semantic_only: bool = False
     speakers: Optional[Sequence[str]] = None
-    multiple_choice_version: int = 1  # 1: use text only; 2: use label in speaker text
+    multiple_choice_version: int = 2  # 1: use text only; 2: use label in speaker text
     num_choices: int = 4
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -250,29 +248,49 @@ class VibeVoiceCollator:
                     + [self.processor.tokenizer.speech_end_id]
                 )
                 attn = attn + [1] * target_latent_len + [1]
-                acoustic_input_mask = speech_input_mask_list + [True] * target_latent_len + [False]
-                if self.voice_input_use_semantic:
-                    semantic_input_mask = speech_input_mask_list + [True] * target_latent_len + [False]
+                if self.generation_use_semantic_only:
+                    acoustic_input_mask = [False] * len(speech_input_mask_list) + [False] * target_latent_len + [False]
                 else:
-                    semantic_input_mask = [False] * len(speech_input_mask_list) + [True] * target_latent_len + [False]
+                    acoustic_input_mask = speech_input_mask_list + [True] * target_latent_len + [False]
+
+                if self.understanding_use_semantic_only:
+                    semantic_input_mask = [False] * len(speech_input_mask_list) + [False] * target_latent_len + [False]
+                else:
+                    if self.voice_input_use_semantic or self.generation_use_semantic_only:
+                        semantic_input_mask = speech_input_mask_list + [True] * target_latent_len + [False]
+                    else:
+                        semantic_input_mask = (
+                            [False] * len(speech_input_mask_list) + [True] * target_latent_len + [False]
+                        )
                 diffusion_loss_mask = [False] * len(speech_input_mask_list) + [True] * target_latent_len + [False]
 
             else:
-                if proc["multiple_choice_answer"][0] is not None:
-                    text = proc["multiple_choice_answer"][0]
+                text = proc["multiple_choice_answer"][0]
                 text_target_ids = self.processor.tokenizer.encode(
                     text,
                     add_special_tokens=False,
                 )
                 ids = ids + text_target_ids + [self.processor.tokenizer.text_end_id]
                 attn = attn + [1] * len(text_target_ids) + [1]
-                acoustic_input_mask = speech_input_mask_list + [False] * len(text_target_ids) + [False]
-                if self.voice_input_use_semantic:
-                    semantic_input_mask = speech_input_mask_list + [False] * len(text_target_ids) + [False]
+
+                if self.understanding_use_semantic_only:
+                    acoustic_input_mask = (
+                        [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
+                    )
                 else:
+                    acoustic_input_mask = speech_input_mask_list + [False] * len(text_target_ids) + [False]
+
+                if self.generation_use_semantic_only:
                     semantic_input_mask = (
                         [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
                     )
+                else:
+                    if self.voice_input_use_semantic or self.understanding_use_semantic_only:
+                        semantic_input_mask = speech_input_mask_list + [False] * len(text_target_ids) + [False]
+                    else:
+                        semantic_input_mask = (
+                            [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
+                        )
                 diffusion_loss_mask = [False] * len(speech_input_mask_list) + [False] * len(text_target_ids) + [False]
             # Ensure text decoding sees an explicit end-of-sequence token after speech output.
             eos_token_id = getattr(self.processor.tokenizer, "eos_id", None)
@@ -309,10 +327,42 @@ class VibeVoiceCollator:
         sample_labels_tensor = pad_sequence(sample_labels, batch_first=True, padding_value=-100)
 
         # is_target waveforms should compute semantic features
-        if self.voice_input_use_semantic:
-            semantic_speech_mask = make_pad_mask(all_speech_latent_lengths)
-            semantic_speech = pad_sequence(all_speech_waveforms, batch_first=True, padding_value=0.0)
-        else:
+        if not self.generation_use_semantic_only and not self.understanding_use_semantic_only:
+            semantic_speech_loss_mask = None
+            if self.voice_input_use_semantic:
+                semantic_speech_mask = make_pad_mask(all_speech_latent_lengths)
+                semantic_speech = pad_sequence(all_speech_waveforms, batch_first=True, padding_value=0.0)
+            else:
+                semantic_speech_waveforms = [
+                    speech_waveform
+                    for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
+                    if is_target
+                ]
+
+                if len(semantic_speech_waveforms) == 0:
+                    semantic_speech_mask = semantic_speech = None
+                else:
+                    semantic_speech_mask = make_pad_mask(
+                        [
+                            len_
+                            for (len_, is_target) in zip(all_speech_latent_lengths, per_segment_is_target)
+                            if is_target
+                        ]
+                    )
+                    semantic_speech = pad_sequence(semantic_speech_waveforms, batch_first=True, padding_value=0.0)
+
+            # all waveforms compute acoustic features
+            if len(all_speech_waveforms) == 0:
+                acoustic_speech_mask = acoustic_speech = acoustic_speech_loss_mask = None
+            else:
+                acoustic_speech_mask = make_pad_mask(all_speech_latent_lengths)
+                acoustic_speech = pad_sequence(all_speech_waveforms, batch_first=True, padding_value=0.0)
+                acoustic_speech_loss_mask = torch.zeros_like(acoustic_speech_mask, dtype=torch.bool)
+                for i, is_target in enumerate(per_segment_is_target):
+                    if is_target:
+                        acoustic_speech_loss_mask[i] = acoustic_speech_mask[i]
+
+        elif self.generation_use_semantic_only:
             semantic_speech_waveforms = [
                 speech_waveform
                 for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
@@ -327,16 +377,61 @@ class VibeVoiceCollator:
                 )
                 semantic_speech = pad_sequence(semantic_speech_waveforms, batch_first=True, padding_value=0.0)
 
-        # all waveforms compute acoustic features
-        if len(all_speech_waveforms) == 0:
-            acoustic_speech_mask = acoustic_speech = acoustic_speech_loss_mask = None
-        else:
-            acoustic_speech_mask = make_pad_mask(all_speech_latent_lengths)
-            acoustic_speech = pad_sequence(all_speech_waveforms, batch_first=True, padding_value=0.0)
-            acoustic_speech_loss_mask = torch.zeros_like(acoustic_speech_mask, dtype=torch.bool)
-            for i, is_target in enumerate(per_segment_is_target):
-                if is_target:
-                    acoustic_speech_loss_mask[i] = acoustic_speech_mask[i]
+            acoustic_speech_waveforms = [
+                speech_waveform
+                for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
+                if not is_target
+            ]
+
+            if len(acoustic_speech_waveforms) == 0:
+                acoustic_speech_mask = acoustic_speech = None
+            else:
+                acoustic_speech_mask = make_pad_mask(
+                    [
+                        len_
+                        for (len_, is_target) in zip(all_speech_latent_lengths, per_segment_is_target)
+                        if not is_target
+                    ]
+                )
+                acoustic_speech = pad_sequence(acoustic_speech_waveforms, batch_first=True, padding_value=0.0)
+
+            acoustic_speech_loss_mask = None
+            semantic_speech_loss_mask = semantic_speech_mask
+
+        elif self.understanding_use_semantic_only:
+            semantic_speech_waveforms = [
+                speech_waveform
+                for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
+                if not is_target
+            ]
+
+            if len(semantic_speech_waveforms) == 0:
+                semantic_speech_mask = semantic_speech = None
+            else:
+                semantic_speech_mask = make_pad_mask(
+                    [
+                        len_
+                        for (len_, is_target) in zip(all_speech_latent_lengths, per_segment_is_target)
+                        if not is_target
+                    ]
+                )
+                semantic_speech = pad_sequence(semantic_speech_waveforms, batch_first=True, padding_value=0.0)
+
+            acoustic_speech_waveforms = [
+                speech_waveform
+                for is_target, speech_waveform in zip(per_segment_is_target, all_speech_waveforms)
+                if is_target
+            ]
+            if len(acoustic_speech_waveforms) == 0:
+                acoustic_speech_mask = acoustic_speech = None
+            else:
+                acoustic_speech_mask = make_pad_mask(
+                    [len_ for (len_, is_target) in zip(all_speech_latent_lengths, per_segment_is_target) if is_target]
+                )
+                acoustic_speech = pad_sequence(acoustic_speech_waveforms, batch_first=True, padding_value=0.0)
+
+            semantic_speech_loss_mask = None
+            acoustic_speech_loss_mask = acoustic_speech_mask
 
         return {
             "input_ids": input_ids_tensor,
@@ -345,6 +440,7 @@ class VibeVoiceCollator:
             "semantic_speech": semantic_speech,
             "acoustic_speech_mask": acoustic_speech_mask,
             "semantic_speech_mask": semantic_speech_mask,
+            "semantic_speech_loss_mask": semantic_speech_loss_mask,
             "acoustic_input_mask": acoustic_input_mask_tensor,
             "semantic_input_mask": semantic_input_mask_tensor,
             "acoustic_speech_loss_mask": acoustic_speech_loss_mask,

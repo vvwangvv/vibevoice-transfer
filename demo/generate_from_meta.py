@@ -7,7 +7,6 @@ from pathlib import Path
 import torch
 from transformers.utils import logging
 
-from vibevoice.modular.lora_loading import load_lora_assets
 from vibevoice.modular.modeling_vibevoice_inference import (
     VibeVoiceForConditionalGenerationInference,
 )
@@ -31,6 +30,18 @@ def parse_args():
         type=Path,
         required=True,
         help="path to meta file",
+    )
+    parser.add_argument(
+        "--understanding-use-semantic-only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--generation-use-semantic-only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--voice-input-no-semantic",
+        action="store_true",
     )
     parser.add_argument(
         "--output",
@@ -118,6 +129,37 @@ def main():
             for k, v in inputs.items():
                 if torch.is_tensor(v):
                     inputs[k] = v.to("cuda")
+
+            if args.generation_use_semantic_only:
+                inputs["acoustic_input_mask"] = torch.zeros_like(inputs["speech_input_mask"]).to("cuda")
+                inputs["acoustic_speech"] = None
+                inputs["acoustic_speech_mask"] = None
+            elif args.understanding_use_semantic_only:
+                inputs["acoustic_input_mask"] = inputs["speech_input_mask"]
+                inputs["acoustic_speech"] = inputs["speech_tensors"]
+                inputs["acoustic_speech_mask"] = inputs["speech_masks"]
+            else:
+                inputs["acoustic_input_mask"] = inputs["speech_input_mask"]
+                inputs["acoustic_speech"] = inputs["speech_tensors"]
+                inputs["acoustic_speech_mask"] = inputs["speech_masks"]
+
+            if args.voice_input_no_semantic:
+                inputs["semantic_input_mask"] = torch.zeros_like(inputs["speech_input_mask"]).to("cuda")
+                inputs["semantic_speech"] = None
+                inputs["semantic_speech_mask"] = None
+            elif args.generation_use_semantic_only:
+                inputs["semantic_input_mask"] = inputs["speech_input_mask"]
+                inputs["semantic_speech"] = inputs["speech_tensors"]
+                inputs["semantic_speech_mask"] = inputs["speech_masks"]
+            elif args.understanding_use_semantic_only:
+                # understanding not using semantic
+                inputs["semantic_input_mask"] = torch.zeros_like(inputs["speech_input_mask"]).to("cuda")
+                inputs["semantic_speech"] = None
+                inputs["semantic_speech_mask"] = None
+            else:
+                inputs["semantic_input_mask"] = inputs["speech_input_mask"]
+                inputs["semantic_speech"] = inputs["speech_tensors"]
+                inputs["semantic_speech_mask"] = inputs["speech_masks"]
 
             # Generate audio
             start_time = time.time()

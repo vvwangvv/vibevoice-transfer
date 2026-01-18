@@ -352,6 +352,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel, GenerationMixi
         semantic_speech_mask: Optional[torch.BoolTensor] = None,
         acoustic_speech_loss_mask: Optional[torch.FloatTensor] = None,
         acoustic_input_mask: Optional[torch.BoolTensor] = None,
+        semantic_speech_loss_mask: Optional[torch.FloatTensor] = None,
         semantic_input_mask: Optional[torch.BoolTensor] = None,
         diffusion_loss_mask: Optional[torch.BoolTensor] = None,
         ddpm_batch_mul: int = 1,
@@ -378,12 +379,16 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel, GenerationMixi
                 acoustic_connect_features = self.model.acoustic_connector(acoustic_tokens)
 
                 x[acoustic_input_mask] += acoustic_connect_features[acoustic_speech_mask]
-                diffusion_speech_target = acoustic_tokens[acoustic_speech_loss_mask]
+                if acoustic_speech_loss_mask is not None:
+                    diffusion_speech_target = acoustic_tokens[acoustic_speech_loss_mask]
 
             if semantic_speech is not None:
                 semantic_tokens = self.compute_semantic_tokens(speech_tensors=semantic_speech)
                 semantic_connect_features = self.model.semantic_connector(semantic_tokens)
                 x[semantic_input_mask] += semantic_connect_features[semantic_speech_mask]
+                # if generation_use_semantic_only is set, we use semantic tokens as diffusion target
+                if semantic_speech_loss_mask is not None:
+                    diffusion_speech_target = semantic_tokens[semantic_speech_loss_mask]
 
         outputs = self.model(
             input_ids=None,
